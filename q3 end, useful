@@ -1,0 +1,365 @@
+#  Struttura attesa del file Excel (un solo foglio):
+#  - prima colonna: nome dell'agente (una riga per agente)
+#  - colonne con una data nell'intestazione: AHT (Average Handling Time) di quel giorno
+#  - colonne con "QA" nell'intestazione: QA score del mese appena finito
+#    (lo script assegna ogni colonna QA al mese dei giorni che la precedono)
+#
+#  L'AHT converte sempre in secondi.
+#
+#  Cosa produce, nella stessa cartella del file Excel:
+#   1. un file Excel con quattro fogli:
+#      - riepilogo_agenti: AHT medio e QA medio di ogni agente nel periodo,
+#        con l'indicazione di chi è anomalo rispetto al resto del team
+#      - giorni_anomali_agente: giorni in cui un agente si discosta molto
+#        dal suo solito
+#      - giorni_anomali_team: giorni in cui un agente si discosta molto
+#        dagli altri nello stesso giorno
+#      - qa_mensili: QA di ogni agente per mese, con gli anomali segnati
+#      - colonne_lette: come lo script ha interpretato ogni colonna
+#  
+#   2. due grafici PNG: AHT medio e QA medio per agente
+#
+#   readxl    legge i file Excel
+#   writexl   scrive i file Excel
+#   dplyr     filtra, raggruppa e riassume tabelle
+#   tidyr     cambia la forma delle tabelle (da "larga" a "lunga")
+#   lubridate lavora con le date
+#   ggplot2  
+pacchetti <- c("readxl", "writexl", "dplyr", "tidyr", "lubridate", "ggplot2")
+mancanti  <- pacchetti[!pacchetti %in% rownames(installed.packages())]
+if (length(mancanti) > 0) install.packages(mancanti)
+
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+
+
+# ----set
+file_excel <- file.choose()   
+foglio     <- 1              
+
+# Periodo da analizzare.
+# NA = gli ultimi 6 mesi presenti nel file (mesi interi, fino all'ultimo giorno con dati).
+# Per scegliere tu l'inizio: inizio_periodo <- as.Date("2026-01-01")
+inizio_periodo <- NA
+mesi_periodo   <- 6
+
+# Soglie per decidere cosa è un outlier (spiegazione al punto 6).
+soglia_iqr <- 1.5   # 1.5 è il valore classico; 3 trova solo i casi estremi
+soglia_z   <- 3.5   # valore consigliato per lo z robusto
+
+# Un AHT pari a 0 di solito vuol dire "nessuna chiamata" (ferie, riposo):
+# con TRUE viene trattato come dato mancante e non come valore bassissimo.
+zero_come_mancante <- TRUE
+
+# Un agente con pochi giorni lavorati nel periodo ha una media poco affidabile:
+# sotto questa soglia resta nel riepilogo ma non entra nel calcolo dei limiti del team.
+min_giorni <- 20
+
+# Righe da ignorare se il file ha righe di totale o di media del team.
+righe_da_escludere <- c("Totale", "Total", "Media", "Average", "Team")
+
+cartella_output <- dirname(file_excel)
+
+
+# ---- 2. Lettura del file ----------------------------------------------
+# Prima si leggono solo le intestazioni (n_max = 0 vuol dire "nessuna riga di dati"),
+# così restano esattamente come sono scritte, anche se "QA score" si ripete.
+intestazioni <- names(read_excel(file_excel, sheet = foglio, n_max = 0,
+                                 .name_repair = "minimal"))
+
+# Poi i dati, tutti come testo: i formati misti (numeri, orari, celle vuote)
+# si convertono dopo, con regole chiare, invece di lasciar indovinare a Excel.
+dati <- read_excel(file_excel, sheet = foglio, col_names = FALSE, skip = 1,
+                   col_types = "text", .name_repair = "minimal")
+
+n_col        <- min(length(intestazioni), ncol(dati))
+dati         <- dati[, seq_len(n_col)]
+intestazioni <- intestazioni[seq_len(n_col)]
+
+# Nomi interni semplici (agente, c1, c2, ...): le intestazioni originali
+# restano nella tabella "mappa" qui sotto.
+names(dati) <- c("agente", paste0("c", seq_len(n_col - 1)))
+
+
+# ---- 3. Capire che cosa contiene ogni colonna ------------------------
+mappa <- tibble(colonna = names(dati)[-1], intestazione = intestazioni[-1])
+
+# Excel salva le date come numeri (giorni dal 30/12/1899): un'intestazione
+# "45658" è in realtà il 01/01/2025. Qui si riconoscono quei numeri...
+numeri    <- suppressWarnings(as.numeric(mappa$intestazione))
+da_numero <- ifelse(!is.na(numeri) & numeri > 30000 & numeri < 60000, numeri, NA)
+data1     <- as.Date(da_numero, origin = "1899-12-30")
+
+# ...e qui le date scritte come testo (01/01/2026, 2026-01-01, ...).
+# Prima prova giorno/mese/anno, il formato italiano.
+data2 <- as.Date(parse_date_time(mappa$intestazione,
+                                 orders = c("dmy", "ymd", "mdy"), quiet = TRUE))
+data2[!is.na(numeri)] <- NA
+
+mappa$data <- coalesce(data1, data2)   # prende la prima data valida tra le due
+mappa$data[!is.na(mappa$data) & (year(mappa$data) < 2000 | year(mappa$data) > 2100)] <- NA
+
+mappa$tipo <- case_when(
+  grepl("qa", mappa$intestazione, ignore.case = TRUE) ~ "qa",
+  !is.na(mappa$data)                                   ~ "giorno",
+  TRUE                                                 ~ "ignorata"
+)
+
+# Ogni giorno appartiene al suo mese; ogni colonna QA al mese dei giorni che la precedono.
+mappa$mese <- as.Date(rep(NA, nrow(mappa)))
+giorni <- mappa$tipo == "giorno"
+mappa$mese[giorni] <- floor_date(mappa$data[giorni], "month")
+
+for (i in which(mappa$tipo == "qa")) {
+  prima <- which(giorni & seq_len(nrow(mappa)) < i)
+  dopo  <- which(giorni & seq_len(nrow(mappa)) > i)
+  rif   <- as.Date(NA)
+  if (length(prima) > 0) {
+    rif <- mappa$data[max(prima)]
+  } else if (length(dopo) > 0) {
+    rif <- mappa$data[min(dopo)]
+  }
+  if (!is.na(rif)) mappa$mese[i] <- floor_date(rif, "month")
+}
+
+cat("\nColonne lette:", sum(mappa$tipo == "giorno"), "giorni,",
+    sum(mappa$tipo == "qa"), "colonne QA,", sum(mappa$tipo == "ignorata"), "ignorate\n")
+if (any(mappa$tipo == "ignorata")) {
+  cat("Colonne ignorate (intestazione non riconosciuta come data né come QA):\n")
+  print(mappa$intestazione[mappa$tipo == "ignorata"])
+}
+
+
+# ---- 4. Da tabella "larga" a tabella "lunga" -------------------------
+# Il file ha una colonna per giorno. Per calcolare è più comodo avere una riga
+# per ogni combinazione agente-giorno: è quello che fa pivot_longer().
+
+# Funzione che trasforma un AHT scritto in qualsiasi modo in secondi.
+in_secondi <- function(x) {
+  x   <- trimws(as.character(x))
+  out <- rep(NA_real_, length(x))
+  # Caso "hh:mm:ss" o "mm:ss" (anche con una data davanti, "1899-12-31 00:05:12")
+  orario <- grepl(":", x)
+  if (any(orario)) {
+    testo <- sub("^.*\\s", "", x[orario])
+    parti <- strsplit(testo, ":")
+    out[orario] <- sapply(parti, function(p) {
+      p <- suppressWarnings(as.numeric(p))
+      if (length(p) == 3) p[1] * 3600 + p[2] * 60 + p[3]
+      else if (length(p) == 2) p[1] * 60 + p[2]
+      else NA_real_
+    })
+  }
+  # Caso numero (accetta anche la virgola decimale)
+  numero <- suppressWarnings(as.numeric(gsub(",", ".", x)))
+  usa    <- !orario & !is.na(numero)
+  out[usa] <- numero[usa]
+  out
+}
+
+lungo <- dati %>%
+  mutate(agente = trimws(agente)) %>%
+  filter(!is.na(agente), agente != "", !agente %in% righe_da_escludere) %>%
+  pivot_longer(-agente, names_to = "colonna", values_to = "valore") %>%
+  left_join(mappa, by = "colonna")
+
+aht <- lungo %>%
+  filter(tipo == "giorno") %>%
+  mutate(aht = in_secondi(valore)) %>%
+  select(agente, data, aht)
+
+# Excel salva gli orari come frazione di giorno (5 minuti = 0,00347):
+# se quasi tutti i valori sono sotto 1, si convertono in secondi.
+mediana_grezza <- median(aht$aht, na.rm = TRUE)
+if (!is.na(mediana_grezza) && mediana_grezza < 1) aht$aht <- aht$aht * 86400
+if (zero_come_mancante) aht$aht[which(aht$aht == 0)] <- NA
+
+qa <- lungo %>%
+  filter(tipo == "qa") %>%
+  mutate(qa = suppressWarnings(as.numeric(gsub(",", ".", gsub("%", "", valore))))) %>%
+  select(agente, mese, qa)
+
+
+# ---- 5. Scelta del periodo di 6 mesi ---------------------------------
+# Si lavora per mesi interi, perché il QA è mensile.
+if (all(is.na(aht$aht))) stop("Nessun valore di AHT leggibile: controlla il foglio scelto e le colonne ignorate elencate sopra.")
+if (is.na(inizio_periodo)) {
+  fine   <- max(aht$data[!is.na(aht$aht)])
+  inizio <- floor_date(fine %m-% months(mesi_periodo - 1), "month")
+} else {
+  inizio <- floor_date(as.Date(inizio_periodo), "month")
+  fine   <- (inizio %m+% months(mesi_periodo)) - 1
+}
+cat("\nPeriodo analizzato:", format(inizio, "%d/%m/%Y"), "-", format(fine, "%d/%m/%Y"), "\n")
+
+aht_p <- aht %>% filter(data >= inizio, data <= fine)
+qa_p  <- qa  %>% filter(mese >= inizio, mese <= fine)
+
+
+# ---- 6. Come si decide che un valore è un outlier ---------------------
+# Due metodi, entrambi robusti: non si lasciano influenzare dagli outlier stessi,
+# a differenza di media e deviazione standard.
+#
+# a) Regola dell'IQR (Tukey). Si ordinano i valori e si prendono il 25° e il
+#    75° percentile (Q1 e Q3); IQR = Q3 - Q1 è l'ampiezza della metà centrale.
+#    È outlier ciò che sta sotto Q1 - 1,5 x IQR o sopra Q3 + 1,5 x IQR.
+#    È la stessa regola dei "pallini" nei boxplot.
+#
+# b) Z robusto. Quante "deviazioni tipiche" un valore dista dalla mediana,
+#    usando la MAD (deviazione assoluta mediana) al posto della deviazione
+#    standard. Sopra 3,5 in valore assoluto è considerato anomalo.
+#
+# Per l'AHT contano entrambe le code: troppo alto (chiamate lunghe) ma anche
+# troppo basso (chiamate chiuse troppo in fretta). Per il QA conta soprattutto
+# la coda bassa, ma lo script segnala entrambe.
+
+# Limiti IQR calcolati su un sottoinsieme (per esempio solo gli agenti con abbastanza giorni)
+limiti_iqr <- function(x, usa = rep(TRUE, length(x)), k = soglia_iqr) {
+  base <- x[usa & !is.na(x)]
+  if (length(base) < 4) return(c(basso = NA_real_, alto = NA_real_))
+  q <- quantile(base, c(0.25, 0.75))
+  c(basso = q[[1]] - k * (q[[2]] - q[[1]]), alto = q[[2]] + k * (q[[2]] - q[[1]]))
+}
+
+etichetta <- function(x, lim) {
+  ifelse(is.na(x) | is.na(lim[["basso"]]), NA,
+         ifelse(x < lim[["basso"]], "basso", ifelse(x > lim[["alto"]], "alto", "")))
+}
+
+z_robusto <- function(x, usa = rep(TRUE, length(x))) {
+  base <- x[usa & !is.na(x)]
+  if (length(base) < 4) return(rep(NA_real_, length(x)))
+  s <- mad(base)              # in R la MAD è già scalata per essere confrontabile con la dev. std.
+  if (s == 0) return(rep(NA_real_, length(x)))
+  (x - median(base)) / s
+}
+
+# Versione da usare dentro i gruppi (per agente, per giorno, per mese)
+iqr_gruppo <- function(x) etichetta(x, limiti_iqr(x))
+
+
+# ---- 7. Riepilogo per agente: chi è anomalo rispetto al team ---------
+riepilogo <- aht_p %>%
+  group_by(agente) %>%
+  summarise(giorni_con_dati = sum(!is.na(aht)),
+            aht_medio       = mean(aht, na.rm = TRUE),
+            aht_mediano     = median(aht, na.rm = TRUE),
+            .groups = "drop") %>%
+  full_join(qa_p %>%
+              group_by(agente) %>%
+              summarise(mesi_con_qa = sum(!is.na(qa)),
+                        qa_medio    = mean(qa, na.rm = TRUE),
+                        .groups = "drop"),
+            by = "agente") %>%
+  mutate(across(c(aht_medio, aht_mediano, qa_medio), ~ ifelse(is.nan(.x), NA, .x)))
+
+affidabili <- !is.na(riepilogo$giorni_con_dati) & riepilogo$giorni_con_dati >= min_giorni
+lim_aht <- limiti_iqr(riepilogo$aht_medio, affidabili)
+lim_qa  <- limiti_iqr(riepilogo$qa_medio,  affidabili)
+
+riepilogo <- riepilogo %>%
+  mutate(
+    aht_iqr     = etichetta(aht_medio, lim_aht),
+    aht_z       = round(z_robusto(aht_medio, affidabili), 2),
+    qa_iqr      = etichetta(qa_medio, lim_qa),
+    qa_z        = round(z_robusto(qa_medio, affidabili), 2),
+    outlier_aht = aht_iqr %in% c("alto", "basso") | (!is.na(aht_z) & abs(aht_z) > soglia_z),
+    outlier_qa  = qa_iqr  %in% c("alto", "basso") | (!is.na(qa_z)  & abs(qa_z)  > soglia_z),
+    nota        = ifelse(affidabili, "", paste0("meno di ", min_giorni, " giorni: media poco affidabile")),
+    aht_medio   = round(aht_medio, 1),
+    qa_medio    = round(qa_medio, 1)
+  ) %>%
+  arrange(desc(outlier_aht | outlier_qa), desc(aht_medio))
+
+
+# ---- 8. Giorni anomali per agente (rispetto al suo solito) -----------
+giorni_agente <- aht_p %>%
+  filter(!is.na(aht)) %>%
+  group_by(agente) %>%
+  mutate(mediana_agente = median(aht),
+         z_agente       = round(z_robusto(aht), 2),
+         iqr_agente     = iqr_gruppo(aht)) %>%
+  ungroup() %>%
+  filter(iqr_agente %in% c("alto", "basso") | (!is.na(z_agente) & abs(z_agente) > soglia_z)) %>%
+  arrange(agente, data)
+
+
+# ---- 9. Giorni anomali rispetto al team nello stesso giorno ----------
+# Utile perché alcuni giorni sono difficili per tutti (picchi, problemi di sistema):
+# qui un valore è anomalo solo se si stacca dagli altri agenti di quel giorno.
+giorni_team <- aht_p %>%
+  filter(!is.na(aht)) %>%
+  group_by(data) %>%
+  mutate(agenti_quel_giorno = n(),
+         mediana_team       = median(aht),
+         z_team             = round(z_robusto(aht), 2)) %>%
+  ungroup() %>%
+  filter(agenti_quel_giorno >= 5, !is.na(z_team), abs(z_team) > soglia_z) %>%
+  arrange(data, desc(abs(z_team)))
+
+
+# ---- 10. QA mensile: chi è anomalo in ciascun mese --------------------
+qa_mensili <- qa_p %>%
+  filter(!is.na(qa)) %>%
+  group_by(mese) %>%
+  mutate(mediana_mese = median(qa),
+         z_mese       = round(z_robusto(qa), 2),
+         iqr_mese     = iqr_gruppo(qa)) %>%
+  ungroup() %>%
+  mutate(outlier = iqr_mese %in% c("alto", "basso") | (!is.na(z_mese) & abs(z_mese) > soglia_z),
+         mese    = format(mese, "%Y-%m"))   # anno-mese, così l'ordine è corretto anche a cavallo d'anno %>%
+  arrange(desc(outlier), mese, qa)
+
+
+# ---- 11. Salvataggio in Excel -----------------------------------------
+nome_file <- file.path(cartella_output,
+                       paste0("outlier_", format(inizio, "%Y%m"), "_", format(fine, "%Y%m"), ".xlsx"))
+write_xlsx(list(riepilogo_agenti      = riepilogo,
+                giorni_anomali_agente = giorni_agente,
+                giorni_anomali_team   = giorni_team,
+                qa_mensili            = qa_mensili,
+                colonne_lette         = mappa),
+           nome_file)
+
+
+# ---- 12. Grafici -------------------------------------------------------
+# Un punto per agente, ordinati dal valore più basso al più alto; in rosso gli
+# outlier, le linee tratteggiate sono i limiti IQR del team.
+grafico <- function(tab, colonna, flag, limiti, titolo, file_png) {
+  d <- tab %>% filter(!is.na(.data[[colonna]]))
+  if (nrow(d) == 0) return(invisible(NULL))
+  g <- ggplot(d, aes(x = reorder(agente, .data[[colonna]]), y = .data[[colonna]],
+                     colour = .data[[flag]])) +
+    geom_point(size = 2.5) +
+    scale_colour_manual(values = c(`FALSE` = "grey45", `TRUE` = "red3"),
+                        labels = c(`FALSE` = "nella norma", `TRUE` = "outlier")) +
+    coord_flip() +
+    labs(x = NULL, y = NULL, colour = NULL,
+         title = paste0(titolo, ", ", format(inizio, "%m/%Y"), " - ", format(fine, "%m/%Y"))) +
+    theme_minimal()
+  lim <- as.numeric(na.omit(limiti))
+  if (length(lim) > 0) g <- g + geom_hline(yintercept = lim, linetype = "dashed", colour = "grey30")
+  ggsave(file.path(cartella_output, file_png), g,
+         width = 8, height = max(4, 0.22 * nrow(d)), dpi = 150)
+}
+
+grafico(riepilogo, "aht_medio", "outlier_aht", lim_aht, "AHT medio per agente (secondi)", "outlier_aht.png")
+grafico(riepilogo, "qa_medio",  "outlier_qa",  lim_qa,  "QA medio per agente",             "outlier_qa.png")
+
+
+# ---- 13. Riassunto a schermo ------------------------------------------
+cat("\nAgenti analizzati:", nrow(riepilogo), "\n")
+cat("Outlier di AHT medio:", sum(riepilogo$outlier_aht), "\n")
+if (any(riepilogo$outlier_aht)) print(riepilogo %>% filter(outlier_aht) %>%
+                                        select(agente, aht_medio, aht_iqr, aht_z, nota))
+cat("\nOutlier di QA medio:", sum(riepilogo$outlier_qa), "\n")
+if (any(riepilogo$outlier_qa)) print(riepilogo %>% filter(outlier_qa) %>%
+                                       select(agente, qa_medio, qa_iqr, qa_z, nota))
+cat("\nGiorni anomali rispetto al solito dell'agente:", nrow(giorni_agente), "\n")
+cat("Giorni anomali rispetto al team:", nrow(giorni_team), "\n")
+cat("QA mensili anomali:", sum(qa_mensili$outlier), "\n")
+cat("\nRisultati salvati in:\n ", nome_file, "\n  e i grafici outlier_aht.png / outlier_qa.png nella stessa cartella\n")
